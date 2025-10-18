@@ -1,0 +1,250 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-backend
+  labels:
+    app: api-backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-backend
+  template:
+    metadata:
+      labels:
+        app: api-backend
+    spec:
+      containers:
+      - name: api
+        image: node:18-alpine
+        ports:
+        - containerPort: 3000
+        env:
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: host
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: port
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: database
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: username
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: password
+        - name: NODE_ENV
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: NODE_ENV
+        - name: API_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: api-config
+              key: API_PORT
+        command: ["/bin/sh"]
+        args: 
+        - -c
+        - |
+          # Crear directorio de trabajo y package.json primero
+          mkdir -p /app
+          cd /app
+          
+          # Crear package.json
+          cat > package.json << 'PKGEOF'
+          {
+            "name": "task-manager-api",
+            "version": "1.0.0",
+            "description": "API para gestión de tareas con PostgreSQL",
+            "main": "app.js",
+            "scripts": {
+              "start": "node app.js"
+            },
+            "dependencies": {
+              "express": "^4.18.2",
+              "pg": "^8.11.3",
+              "cors": "^2.8.5"
+            }
+          }
+          PKGEOF
+          
+          echo "📦 Instalando dependencias de Node.js..."
+          npm install --silent
+          
+          echo "🔧 Instalando cliente PostgreSQL..."
+          apk add --no-cache postgresql-client > /dev/null 2>&1
+          
+          # Crear aplicación
+          cat > app.js << 'APPEOF'
+          const express = require('express');
+          const { Pool } = require('pg');
+          const cors = require('cors');
+
+          const app = express();
+          const port = process.env.API_PORT || 3000;
+
+          console.log('🔌 Configurando conexión a PostgreSQL...');
+          console.log('Host:', process.env.DB_HOST);
+          console.log('Port:', process.env.DB_PORT);
+          console.log('Database:', process.env.DB_NAME);
+          console.log('User:', process.env.DB_USER);
+
+          // Configuración de la base de datos
+          const pool = new Pool({
+            host: process.env.DB_HOST,
+            port: process.env.DB_PORT,
+            database: process.env.DB_NAME,
+            user: process.env.DB_USER,
+            password: process.env.DB_PASSWORD,
+            connectionTimeoutMillis: 5000,
+            idleTimeoutMillis: 30000,
+          });
+
+          // Middleware
+          app.use(cors());
+          app.use(express.json());
+
+          // Función para probar conexión
+          async function testConnection() {
+            try {
+              const client = await pool.connect();
+              console.log('✅ Conexión a PostgreSQL exitosa');
+              client.release();
+              return true;
+            } catch (err) {
+              console.error('❌ Error conectando a PostgreSQL:', err.message);
+              return false;
+            }
+          }
+
+          // Inicializar base de datos
+          async function initDB() {
+            try {
+              console.log('🗄️  Inicializando base de datos...');
+              await pool.query(`
+                CREATE TABLE IF NOT EXISTS tareas (
+                  id SERIAL PRIMARY KEY,
+                  titulo VARCHAR(255) NOT NULL,
+                  completada BOOLEAN DEFAULT FALSE,
+                  fecha_creacion TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+              `);
+              console.log('✅ Tabla de tareas inicializada');
+              
+              // Insertar datos de ejemplo
+              const result = await pool.query('SELECT COUNT(*) FROM tareas');
+              if (parseInt(result.rows[0].count) === 0) {
+                await pool.query(`
+                  INSERT INTO tareas (titulo) VALUES 
+                  ('Aprender Kubernetes'),
+                  ('Desplegar aplicación con StatefulSet'),
+                  ('Configurar ConfigMaps y Secrets')
+                `);
+                console.log('✅ Datos de ejemplo insertados');
+              }
+            } catch (err) {
+              console.error('❌ Error inicializando BD:', err.message);
+              throw err;
+            }
+          }
+
+          // Rutas de la API
+          app.get('/api/health', async (req, res) => {
+            const dbStatus = await testConnection();
+            res.json({ 
+              status: dbStatus ? 'OK' : 'ERROR',
+              pod: process.env.HOSTNAME,
+              timestamp: new Date().toISOString(),
+              database: dbStatus ? 'Connected' : 'Disconnected'
+            });
+          });
+
+          app.get('/api/tareas', async (req, res) => {
+            try {
+              const result = await pool.query('SELECT * FROM tareas ORDER BY fecha_creacion DESC');
+              res.json({
+                success: true,
+                data: result.rows,
+                count: result.rows.length,
+                pod: process.env.HOSTNAME
+              });
+            } catch (err) {
+              console.error('❌ Error obteniendo tareas:', err.message);
+              res.status(500).json({ error: err.message });
+            }
+          });
+
+          app.post('/api/tareas', async (req, res) => {
+            try {
+              const { titulo } = req.body;
+              if (!titulo) {
+                return res.status(400).json({ error: 'El título es requerido' });
+              }
+              const result = await pool.query(
+                'INSERT INTO tareas (titulo) VALUES ($1) RETURNING *',
+                [titulo]
+              );
+              res.status(201).json({
+                success: true,
+                data: result.rows[0],
+                message: 'Tarea creada exitosamente'
+              });
+            } catch (err) {
+              console.error('❌ Error creando tarea:', err.message);
+              res.status(500).json({ error: err.message });
+            }
+          });
+
+          // Inicializar aplicación
+          async function startApp() {
+            console.log('🚀 Iniciando aplicación...');
+            
+            // Esperar a que PostgreSQL esté listo
+            let connected = false;
+            let attempts = 0;
+            while (!connected && attempts < 10) {
+              connected = await testConnection();
+              if (!connected) {
+                console.log('⏳ Esperando a PostgreSQL... intento', attempts + 1);
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                attempts++;
+              }
+            }
+
+            if (!connected) {
+              console.error('❌ No se pudo conectar a PostgreSQL después de 10 intentos');
+              process.exit(1);
+            }
+
+            // Inicializar BD
+            await initDB();
+
+            // Iniciar servidor
+            app.listen(port, () => {
+              console.log(`🎉 API ejecutándose en puerto ${port}`);
+              console.log(`📊 Pod: ${process.env.HOSTNAME}`);
+              console.log(`🗄️  BD: ${process.env.DB_HOST}:${process.env.DB_PORT}/${process.env.DB_NAME}`);
+            });
+          }
+
+          startApp().catch(err => {
+            console.error('❌ Error fatal iniciando aplicación:', err);
+            process.exit(1);
+          });
+          APPEOF
+          
+          echo "🚀 Iniciando aplicación Node.js..."
+          node app.js
